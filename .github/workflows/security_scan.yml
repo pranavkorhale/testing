@@ -16,6 +16,10 @@ on:
         required: true
         default: 'app/build/outputs/apk/release/app-release.apk'
 
+env:
+  MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
+  MOBSF_URL: 'http://localhost:8000/api/v1'
+
 jobs:
   security-scan:
     name: MobSF Security Analysis
@@ -27,7 +31,11 @@ jobs:
         image: opensecurity/mobile-security-framework-mobsf:latest
         ports:
           - 8000:8000
-        options: --health-cmd "curl -f http://localhost:8000/ || exit 1" --health-interval 10s --health-timeout 5s --health-retries 5
+        options: >-
+          --health-cmd "curl -f http://localhost:8000/ || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Checkout repository
@@ -40,8 +48,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install requests jq
+
+      - name: Validate MobSF API Key
+        if: env.MOBSF_API_KEY == ''
+        run: |
+          echo "::error::MobSF API key not found in secrets"
+          exit 1
 
       - name: Determine APK path
         id: apk-path
@@ -97,13 +111,6 @@ jobs:
         id: scan
         continue-on-error: true
         run: |
-          # Get API key from MobSF
-          API_KEY="abf8e17cd7f0b7f29fbe36e7e915c4d4d40df3159c0c1a6619346c1b79e1e5b3"
-          if [ -z "$API_KEY" ]; then
-            echo "::error::Failed to retrieve MobSF API key"
-            exit 1
-          fi
-
           # Python script to handle scanning
           cat > scan_apk.py << 'EOF'
           import requests
@@ -113,15 +120,18 @@ jobs:
           import time
           from urllib.parse import quote
 
-          def scan_apk(apk_path, api_key):
-              base_url = "http://localhost:8000/api/v1"
+          def scan_apk(apk_path, api_key, mobsf_url):
               headers = {"Authorization": api_key}
               
               # Step 1: Upload APK
               print(f"Uploading APK: {apk_path}")
-              with open(apk_path, 'rb') as f:
-                  files = {'file': (os.path.basename(apk_path), f, 'application/vnd.android.package-archive')}
-                  response = requests.post(f"{base_url}/upload", files=files, headers=headers)
+              try:
+                  with open(apk_path, 'rb') as f:
+                      files = {'file': (os.path.basename(apk_path), f, 'application/vnd.android.package-archive')}
+                      response = requests.post(f"{mobsf_url}/upload", files=files, headers=headers, timeout=60)
+              except Exception as e:
+                  print(f"::error::Upload failed: {str(e)}")
+                  return False
               
               if response.status_code != 200:
                   print(f"::error::Upload failed: {response.text}")
@@ -134,11 +144,16 @@ jobs:
 
               # Step 2: Start Scan
               print("Starting scan...")
-              response = requests.post(
-                  f"{base_url}/scan",
-                  data={"hash": file_hash, "scan_type": "apk"},
-                  headers=headers
-              )
+              try:
+                  response = requests.post(
+                      f"{mobsf_url}/scan",
+                      data={"hash": file_hash, "scan_type": "apk"},
+                      headers=headers,
+                      timeout=60
+                  )
+              except Exception as e:
+                  print(f"::error::Scan failed: {str(e)}")
+                  return False
               
               if response.status_code != 200:
                   print(f"::error::Scan failed: {response.text}")
@@ -146,23 +161,33 @@ jobs:
 
               # Step 3: Wait for scan to complete
               print("Waiting for scan to complete...")
-              status_url = f"{base_url}/scan_status?hash={file_hash}"
+              status_url = f"{mobsf_url}/scan_status?hash={file_hash}"
+              scan_completed = False
               for _ in range(30):  # Wait up to 5 minutes (30 * 10 seconds)
-                  status_response = requests.get(status_url, headers=headers)
-                  if status_response.status_code == 200:
-                      status_data = status_response.json()
-                      if status_data.get("status") == "completed":
-                          break
+                  try:
+                      status_response = requests.get(status_url, headers=headers, timeout=30)
+                      if status_response.status_code == 200:
+                          status_data = status_response.json()
+                          if status_data.get("status") == "completed":
+                              scan_completed = True
+                              break
+                  except Exception as e:
+                      print(f"::warning::Status check failed: {str(e)}")
                   time.sleep(10)
-              else:
+              
+              if not scan_completed:
                   print("::error::Scan timed out")
                   return False
 
               # Step 4: Get report
               print("Retrieving report...")
-              report_response = requests.get(f"{base_url}/report/{file_hash}", headers=headers)
-              if report_response.status_code != 200:
-                  print(f"::error::Failed to get report: {report_response.text}")
+              try:
+                  report_response = requests.get(f"{mobsf_url}/report/{file_hash}", headers=headers, timeout=60)
+                  if report_response.status_code != 200:
+                      print(f"::error::Failed to get report: {report_response.text}")
+                      return False
+              except Exception as e:
+                  print(f"::error::Report retrieval failed: {str(e)}")
                   return False
 
               report = report_response.json()
@@ -172,17 +197,18 @@ jobs:
                   json.dump(report, f, indent=2)
               
               # Create summary
+              security_score = report.get("security_score", {})
               summary = {
                   "app_name": report.get("file_name", "Unknown"),
                   "package_name": report.get("package_name", "Unknown"),
                   "version": report.get("version_name", "Unknown"),
-                  "security_score": report.get("security_score", {}).get("average_cvss", 0),
-                  "critical_count": report.get("security_score", {}).get("critical", 0),
-                  "high_count": report.get("security_score", {}).get("high", 0),
-                  "medium_count": report.get("security_score", {}).get("medium", 0),
-                  "low_count": report.get("security_score", {}).get("low", 0),
-                  "total_issues": sum(report.get("security_score", {}).values()),
-                  "has_critical_issues": report.get("security_score", {}).get("critical", 0) > 0
+                  "security_score": security_score.get("average_cvss", 0),
+                  "critical_count": security_score.get("critical", 0),
+                  "high_count": security_score.get("high", 0),
+                  "medium_count": security_score.get("medium", 0),
+                  "low_count": security_score.get("low", 0),
+                  "total_issues": sum(v for k, v in security_score.items() if k in ['critical', 'high', 'medium', 'low']),
+                  "has_critical_issues": security_score.get("critical", 0) > 0
               }
               
               with open("scan_summary.json", "w") as f:
@@ -190,7 +216,7 @@ jobs:
 
               # Generate markdown report
               with open("scan_report.md", "w") as f:
-                  f.write(f"# MobSF Security Scan Report\n\n")
+                  f.write("# MobSF Security Scan Report\n\n")
                   f.write(f"- **App Name:** {summary['app_name']}\n")
                   f.write(f"- **Package:** {summary['package_name']}\n")
                   f.write(f"- **Version:** {summary['version']}\n")
@@ -206,22 +232,24 @@ jobs:
                       for category, findings in report["security_analysis"].items():
                           f.write(f"### {category.replace('_', ' ').title()}\n")
                           for issue, details in findings.items():
-                              f.write(f"- **{issue}** ({details.get('severity', 'Unknown')}): {details.get('description', 'No description')}\n")
+                              severity = details.get('severity', 'Unknown').capitalize()
+                              description = details.get('description', 'No description')
+                              f.write(f"- **{issue}** ({severity}): {description}\n")
                           f.write("\n")
 
               return True
 
           if __name__ == "__main__":
-              if len(sys.argv) != 3:
-                  print("Usage: python scan_apk.py <apk_path> <api_key>")
+              if len(sys.argv) != 4:
+                  print("Usage: python scan_apk.py <apk_path> <api_key> <mobsf_url>")
                   sys.exit(1)
               
-              success = scan_apk(sys.argv[1], sys.argv[2])
+              success = scan_apk(sys.argv[1], sys.argv[2], sys.argv[3])
               sys.exit(0 if success else 1)
           EOF
 
           # Run the scan
-          python scan_apk.py "${{ steps.apk-path.outputs.apk_path }}" "$API_KEY"
+          python scan_apk.py "${{ steps.apk-path.outputs.apk_path }}" "$MOBSF_API_KEY" "$MOBSF_URL"
 
       - name: Upload reports
         if: always()
@@ -232,6 +260,7 @@ jobs:
             mobsf_report.json
             scan_summary.json
             scan_report.md
+          retention-days: 7
 
       - name: Post Scan Summary
         if: always()
@@ -246,10 +275,10 @@ jobs:
             # Add conclusion
             if jq -e '.has_critical_issues == true' scan_summary.json >/dev/null; then
               echo "::error::❌ Critical vulnerabilities found! Security check FAILED." >> $GITHUB_STEP_SUMMARY
-              echo "::set-output name=scan_result::failure"
+              echo "scan_result=failure" >> $GITHUB_OUTPUT
             else
               echo "::notice::✅ No critical vulnerabilities found. Security check PASSED." >> $GITHUB_STEP_SUMMARY
-              echo "::set-output name=scan_result::success"
+              echo "scan_result=success" >> $GITHUB_OUTPUT
             fi
             
             # Add link to full report
@@ -257,7 +286,7 @@ jobs:
             echo "📄 [Download Full Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
           else
             echo "::warning::Scan summary not generated" >> $GITHUB_STEP_SUMMARY
-            echo "::set-output name=scan_result::error"
+            echo "scan_result=error" >> $GITHUB_OUTPUT
           fi
 
       - name: Fail workflow if critical issues found
@@ -265,5 +294,3 @@ jobs:
         run: |
           echo "::error::Critical security issues detected in scan!"
           exit 1
-          
-          
