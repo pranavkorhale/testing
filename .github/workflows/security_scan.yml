@@ -98,7 +98,7 @@ jobs:
         continue-on-error: true
         run: |
           # Get API key from MobSF
-          API_KEY=$(curl -s http://localhost:8000/api_docs | grep -oP 'api_key=\K[a-zA-Z0-9]+' || echo "")
+          API_KEY="abf8e17cd7f0b7f29fbe36e7e915c4d4d40df3159c0c1a6619346c1b79e1e5b3"
           if [ -z "$API_KEY" ]; then
             echo "::error::Failed to retrieve MobSF API key"
             exit 1
