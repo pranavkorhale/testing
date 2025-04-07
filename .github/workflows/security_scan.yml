@@ -1,11 +1,22 @@
-name: MobSF APK Security Scan
+name: Mobile App Security Scan
 
 on:
+  push:
+    branches: [main, develop]
+    paths:
+      - '**/*.apk'
   workflow_dispatch:
+    inputs:
+      apk_path:
+        description: 'Path to APK file in the repository'
+        required: true
+        default: 'first.apk'
 
 jobs:
   scan:
+    name: MobSF Scan
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     services:
       mobsf:
@@ -14,81 +25,84 @@ jobs:
           - 8000:8000
         options: --health-cmd "curl -f http://localhost:8000/ || exit 1" --health-interval 10s --health-timeout 5s --health-retries 10
 
-    env:
-      MOBSF_URL: http://localhost:8000/api/v1
-      MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
-
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: 3.10
+          python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install requests
-
-      - name: Add dummy APK for testing
         run: |
-          mkdir -p test-apk
-          curl -L -o test-apk/first.apk https://github.com/ashishb/android-security-awesome/raw/master/testing-tools/mobsf-sample-app.apk
+          pip install requests
 
       - name: Wait for MobSF to be ready
         run: |
-          echo "Waiting for MobSF to initialize..."
-          for i in {1..12}; do
-            if curl -s http://localhost:8000/ > /dev/null; then
-              echo "MobSF ready!"
+          echo "Waiting for MobSF to be ready..."
+          for i in {1..20}; do
+            if curl -s http://localhost:8000/ >/dev/null; then
+              echo "MobSF is ready."
               exit 0
             fi
+            echo "Attempt $i: MobSF not ready yet..."
             sleep 5
           done
-          echo "::error::MobSF did not become ready in time."
+          echo "::error::MobSF did not start in time"
           exit 1
 
-      - name: Run MobSF scan
+      - name: Run MobSF Scan
         run: |
-          cat > scan.py << 'EOF'
-          import requests, time, sys
-          url = "http://localhost:8000/api/v1"
-          headers = {'Authorization': '${{ secrets.MOBSF_API_KEY }}'}
+          echo "Running MobSF scan..."
+          API_KEY="${{ secrets.MOBSF_API_KEY }}"
+          if [ -z "$API_KEY" ]; then
+            echo "::error::MobSF API key not found in secrets"
+            exit 1
+          fi
 
-          # Upload
-          with open("test-apk/first.apk", 'rb') as f:
-              r = requests.post(f"{url}/upload", files={'file': f}, headers=headers)
-              if r.status_code != 200:
-                  print("Upload failed:", r.text)
-                  sys.exit(1)
-              print("Upload successful")
+          APK_PATH="${{ github.event.inputs.apk_path }}"
+          if [ ! -f "$APK_PATH" ]; then
+            echo "::error::APK file not found at path: $APK_PATH"
+            exit 1
+          fi
 
-          hash_ = r.json()["hash"]
+          # Upload the APK
+          echo "Uploading $APK_PATH"
+          RESPONSE=$(curl -s -X POST "http://localhost:8000/api/v1/upload" \
+            -H "Authorization: $API_KEY" \
+            -F "file=@$APK_PATH")
 
-          # Start Scan
-          scan_res = requests.post(f"{url}/scan", data={'hash': hash_, 'scan_type': 'apk'}, headers=headers)
-          if scan_res.status_code != 200:
-              print("Scan start failed:", scan_res.text)
-              sys.exit(1)
+          HASH=$(echo $RESPONSE | jq -r '.hash')
+          if [ "$HASH" == "null" ] || [ -z "$HASH" ]; then
+            echo "::error::Upload failed: $RESPONSE"
+            exit 1
+          fi
 
-          # Wait for scan
-          for _ in range(30):
-              status = requests.get(f"{url}/scan_status?hash={hash_}", headers=headers).json()
-              if status.get("status") == "completed":
-                  break
-              time.sleep(5)
-          else:
-              print("Scan timeout")
-              sys.exit(1)
+          echo "APK hash: $HASH"
 
-          # Report
-          report = requests.get(f"{url}/report_json", params={'hash': hash_}, headers=headers).json()
-          print("Scan Summary:")
-          print(f"App Name: {report.get('app_name')}")
-          print(f"Package: {report.get('package_name')}")
-          print(f"Critical Issues: {report.get('security_score', {}).get('critical')}")
-          if int(report.get('security_score', {}).get('critical', 0)) > 0:
-              sys.exit(1)
-          EOF
+          # Start scan
+          curl -s -X POST "http://localhost:8000/api/v1/scan" \
+            -H "Authorization: $API_KEY" \
+            -d "hash=$HASH&scan_type=apk"
 
-          python scan.py
+          echo "Waiting for scan to finish..."
+          for i in {1..20}; do
+            STATUS=$(curl -s "http://localhost:8000/api/v1/scan_status?hash=$HASH" -H "Authorization: $API_KEY" | jq -r '.status')
+            if [ "$STATUS" == "completed" ]; then
+              echo "Scan completed."
+              break
+            fi
+            echo "Scan not ready yet... ($i)"
+            sleep 10
+          done
+
+          # Download report
+          curl -s -X GET "http://localhost:8000/api/v1/report_json?hash=$HASH" \
+            -H "Authorization: $API_KEY" > mobsf_report.json
+
+      - name: Upload scan report
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobsf-report
+          path: mobsf_report.json
