@@ -17,7 +17,6 @@ on:
         default: 'app/build/outputs/apk/release/app-release.apk'
 
 env:
-  MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
   MOBSF_URL: 'http://localhost:8000/api/v1'
 
 jobs:
@@ -52,12 +51,19 @@ jobs:
           pip install requests jq
 
       - name: Validate MobSF API Key
-        if: env.MOBSF_API_KEY == ''
+        id: validate-key
         run: |
-          echo "::error::MobSF API key not found in secrets"
-          exit 1
+          if [ -z "${{ secrets.MOBSF_API_KEY }}" ]; then
+            echo "::error::MobSF API key not found in secrets. Please add 'MOBSF_API_KEY' to your repository secrets."
+            echo "skip_scan=true" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "MobSF API key found in secrets"
+            echo "skip_scan=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Determine APK path
+        if: steps.validate-key.outputs.skip_scan == 'false'
         id: apk-path
         run: |
           # For workflow_dispatch events
@@ -94,6 +100,7 @@ jobs:
           echo "apk_path=${APK_PATH}" >> $GITHUB_OUTPUT
 
       - name: Wait for MobSF to be ready
+        if: steps.validate-key.outputs.skip_scan == 'false'
         run: |
           echo "Waiting for MobSF to start..."
           for i in {1..12}; do
@@ -108,8 +115,11 @@ jobs:
           exit 1
 
       - name: Run MobSF Scan
+        if: steps.validate-key.outputs.skip_scan == 'false'
         id: scan
         continue-on-error: true
+        env:
+          MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
         run: |
           # Python script to handle scanning
           cat > scan_apk.py << 'EOF'
@@ -252,7 +262,7 @@ jobs:
           python scan_apk.py "${{ steps.apk-path.outputs.apk_path }}" "$MOBSF_API_KEY" "$MOBSF_URL"
 
       - name: Upload reports
-        if: always()
+        if: always() && steps.validate-key.outputs.skip_scan == 'false'
         uses: actions/upload-artifact@v4
         with:
           name: mobsf-reports-${{ github.run_id }}
@@ -263,7 +273,7 @@ jobs:
           retention-days: 7
 
       - name: Post Scan Summary
-        if: always()
+        if: always() && steps.validate-key.outputs.skip_scan == 'false'
         run: |
           if [ -f scan_summary.json ]; then
             echo "## MobSF Security Scan Results" >> $GITHUB_STEP_SUMMARY
@@ -290,7 +300,7 @@ jobs:
           fi
 
       - name: Fail workflow if critical issues found
-        if: steps.scan.outcome == 'failure' || (always() && steps.scan.conclusion == 'failure')
+        if: steps.scan.outcome == 'failure' || (always() && steps.scan.conclusion == 'failure' && steps.validate-key.outputs.skip_scan == 'false')
         run: |
           echo "::error::Critical security issues detected in scan!"
           exit 1
