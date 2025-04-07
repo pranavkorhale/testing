@@ -1,44 +1,21 @@
-name: Mobile App Security Scan
+name: MobSF Security Scan
 
 on:
-  push:
-    branches: [main, develop]
-    paths:
-      - '**/*.apk'
-  pull_request:
-    branches: [main, develop]
-    paths:
-      - '**/*.apk'
   workflow_dispatch:
     inputs:
       apk_path:
-        description: 'Path to APK file to scan'
+        description: 'Path to the APK file'
         required: true
-        default: 'app/build/outputs/apk/release/app-release.apk'
+        default: 'first.apk'
 
 jobs:
-  security-scan:
-    name: MobSF Security Analysis
+  mobsf_scan:
+    name: Run MobSF Scan
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    services:
-      mobsf:
-        image: opensecurity/mobile-security-framework-mobsf:latest
-        ports:
-          - 8000:8000
-        options: >-
-          --health-cmd "curl -f http://localhost:8000/ || exit 1" 
-          --health-interval 10s 
-          --health-timeout 5s 
-          --health-retries 5
-
-    env:
-      MOBSF_URL: http://localhost:8000/api/v1
-      MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
-
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -48,116 +25,92 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests jq
+          pip install requests
 
-      - name: Determine APK path
-        id: apk-path
+      - name: Check MobSF API key
+        id: check-api
         run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            APK_PATH="${{ github.event.inputs.apk_path }}"
-          else
-            if [ "${{ github.event_name }}" == "push" ]; then
-              CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} || echo "")
-            else
-              CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} || echo "")
-            fi
-            CHANGED_APKS=$(echo "$CHANGED_FILES" | grep '\.apk$' || true)
-            APK_PATH=$(echo "$CHANGED_APKS" | head -n 1)
-            if [ -z "$APK_PATH" ]; then
-              echo "No changed APKs detected, using default path"
-              APK_PATH="app/build/outputs/apk/release/app-release.apk"
-            fi
+          if [ -z "${{ secrets.MOBSF_API_KEY }}" ]; then
+            echo "::error::MobSF API key not found. Please set MOBSF_API_KEY in repository secrets."
+            exit 1
           fi
-
-          if [ ! -f "$APK_PATH" ]; then
-            echo "::warning::APK not found at specified path, searching project..."
-            APK_PATH=$(find . -path '*/build/outputs/apk/*.apk' | head -n 1 || echo "")
-            if [ -z "$APK_PATH" ]; then
-              echo "::error::No APK file found in the repository"
-              exit 1
-            fi
-          fi
-
-          echo "Using APK at: $APK_PATH"
-          echo "apk_path=${APK_PATH}" >> $GITHUB_OUTPUT
-
-      - name: Wait for MobSF to be ready
-        run: |
-          for i in {1..12}; do
-            if curl -s http://localhost:8000/ >/dev/null; then
-              echo "MobSF is ready"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "::error::MobSF did not start within 60 seconds"
-          exit 1
 
       - name: Run MobSF Scan
+        id: scan
+        env:
+          MOBSF_API_KEY: ${{ secrets.MOBSF_API_KEY }}
+          MOBSF_URL: http://localhost:8000/api/v1
         run: |
           echo "Running MobSF scan..."
-          cat > scan_apk.py << 'EOF'
+
+          APK_PATH="${{ github.event.inputs.apk_path }}"
+          if [ ! -f "$APK_PATH" ]; then
+            echo "::error::APK file not found at $APK_PATH"
+            exit 1
+          fi
+
+          python3 <<EOF
 import requests
+import time
 import json
 import os
 import sys
-import time
 
-def scan_apk(apk_path, api_key):
-    base_url = os.environ.get("MOBSF_URL")
-    headers = {"Authorization": api_key}
-    with open(apk_path, 'rb') as f:
-        files = {'file': (os.path.basename(apk_path), f, 'application/vnd.android.package-archive')}
-        r = requests.post(f"{base_url}/upload", files=files, headers=headers)
+MOBSF_URL = os.getenv("MOBSF_URL")
+API_KEY = os.getenv("MOBSF_API_KEY")
+APK_PATH = "${APK_PATH}"
+
+headers = {"Authorization": API_KEY}
+
+# Upload APK
+with open(APK_PATH, "rb") as f:
+    files = {'file': (os.path.basename(APK_PATH), f, 'application/vnd.android.package-archive')}
+    r = requests.post(f"{MOBSF_URL}/upload", files=files, headers=headers)
+
     if r.status_code != 200:
         print(f"::error::Upload failed: {r.text}")
-        return False
+        sys.exit(1)
 
     file_hash = r.json().get("hash")
-    if not file_hash:
-        print("::error::No file hash returned")
-        return False
 
-    r = requests.post(f"{base_url}/scan", data={"hash": file_hash, "scan_type": "apk"}, headers=headers)
-    if r.status_code != 200:
-        print(f"::error::Scan failed: {r.text}")
-        return False
+# Start scan
+scan_res = requests.post(f"{MOBSF_URL}/scan", data={"hash": file_hash, "scan_type": "apk"}, headers=headers)
+if scan_res.status_code != 200:
+    print(f"::error::Scan failed: {scan_res.text}")
+    sys.exit(1)
 
-    for _ in range(30):
-        status = requests.get(f"{base_url}/scan_status?hash={file_hash}", headers=headers)
-        if status.status_code == 200 and status.json().get("status") == "completed":
-            break
-        time.sleep(10)
-    else:
-        print("::error::Scan timed out")
-        return False
+# Wait for scan to complete
+print("Waiting for scan to complete...")
+for _ in range(30):
+    status = requests.get(f"{MOBSF_URL}/scan_status?hash={file_hash}", headers=headers)
+    if status.status_code == 200 and status.json().get("status") == "completed":
+        break
+    time.sleep(10)
+else:
+    print("::error::Scan timeout")
+    sys.exit(1)
 
-    report = requests.get(f"{base_url}/report/{file_hash}", headers=headers)
-    if report.status_code != 200:
-        print(f"::error::Failed to get report: {report.text}")
-        return False
+# Get report
+report = requests.get(f"{MOBSF_URL}/report_json", params={"hash": file_hash}, headers=headers)
+if report.status_code != 200:
+    print(f"::error::Report fetch failed: {report.text}")
+    sys.exit(1)
 
-    with open("mobsf_report.json", "w") as f:
-        json.dump(report.json(), f, indent=2)
+with open("mobsf_report.json", "w") as f:
+    f.write(report.text)
 
-    return True
+data = report.json()
+critical = data.get("security_score", {}).get("critical", 0)
 
-if __name__ == "__main__":
-    apk_path = sys.argv[1]
-    api_key = os.environ.get("MOBSF_API_KEY")
-    if not api_key:
-        print("::error::MobSF API key not found")
-        sys.exit(1)
-    success = scan_apk(apk_path, api_key)
-    sys.exit(0 if success else 1)
+# Print summary
+print("Critical issues:", critical)
+if critical > 0:
+    print("::error::Critical issues detected.")
+    sys.exit(1)
 EOF
 
-          python scan_apk.py "${{ steps.apk-path.outputs.apk_path }}"
-
-      - name: Upload MobSF Reports
-        if: always()
+      - name: Upload MobSF Report
         uses: actions/upload-artifact@v4
         with:
-          name: mobsf-reports-${{ github.run_id }}
-          path: |
-            mobsf_report.json
+          name: mobsf-report
+          path: mobsf_report.json
